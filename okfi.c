@@ -2545,8 +2545,11 @@ static int run_browser(int picker_active) {
 		if (split < 20)
 			split = 20;
 		int top = 2, bottom = rows - 2, visible = bottom - top;
-		int listx = 1, listw = split - 1;
-		int bodyx = split + 1, bodyw = cols - split - 2;
+		/* frame edges at 0, split, cols-1; content padded 1 col inside each pane */
+		int listx = 2, listw = split - 3;
+		int bodyx = split + 2, bodyw = cols - split - 4;
+		if (listw < 1)
+			listw = 1;
 		if (bodyw < 1)
 			bodyw = 1;
 

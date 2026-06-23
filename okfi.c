@@ -17,6 +17,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
 
 /* ---- model ------------------------------------------------------------- */
 
@@ -49,15 +50,34 @@ static char *trim(char *s) {
 	return s;
 }
 
-/* Display width approximated as UTF-8 codepoint count over a byte range
- * (ignores double-width).
- * ponytail: char-count not wcwidth; swap in wcwidth if CJK alignment matters. */
+/* display width of one UTF-8 codepoint (the bytes [s, s+k)); folds unknown /
+ * non-printable to 1 so a stray byte still advances rather than collapsing the
+ * layout. Combining marks (wcwidth 0) report 0 so they stack on the prior cell. */
+static int cell_width(const char *s, int k, mbstate_t *st) {
+	wchar_t wc;
+	size_t r = mbrtowc(&wc, s, (size_t)k, st);
+	if (r == (size_t)-1 || r == (size_t)-2) {
+		memset(st, 0, sizeof *st);
+		return 1;
+	}
+	int cw = wcwidth(wc);
+	return cw < 0 ? 1 : cw;
+}
+
+/* display width (columns) of a byte range, measured with wcwidth — not a raw
+ * codepoint count — so em-dashes, arrows, and double-width glyphs align. */
 static int u8len_n(const char *s, int bytes) {
-	int n = 0;
-	for (int i = 0; i < bytes; i++)
-		if (((unsigned char)s[i] & 0xC0) != 0x80)
-			n++;
-	return n;
+	mbstate_t st;
+	memset(&st, 0, sizeof st);
+	int cols = 0, i = 0;
+	while (i < bytes) {
+		int j = i + 1;
+		while (j < bytes && ((unsigned char)s[j] & 0xC0) == 0x80)
+			j++;
+		cols += cell_width(s + i, j - i, &st);
+		i = j;
+	}
+	return cols;
 }
 
 static const char *base_name(const char *p) {
@@ -828,13 +848,19 @@ static void free_wl(void) {
 
 /* byte offset reached after advancing `cols` UTF-8 codepoints (NUL-bounded) */
 static int u8_advance(const char *s, int cols) {
+	mbstate_t st;
+	memset(&st, 0, sizeof st);
 	int c = 0;
 	const char *p = s;
 	while (*p && c < cols) {
-		p++;
-		while (((unsigned char)*p & 0xC0) == 0x80)
-			p++;
-		c++;
+		const char *q = p + 1;
+		while (((unsigned char)*q & 0xC0) == 0x80)
+			q++;
+		int cw = cell_width(p, (int)(q - p), &st);
+		if (c + cw > cols)
+			break; /* a double-width glyph won't fit the remaining columns */
+		c += cw;
+		p = q;
 	}
 	return (int)(p - s);
 }
@@ -1549,16 +1575,55 @@ static void build_right(const Concept *c, int width) {
 }
 
 /* draw one styled line, switching ncurses attributes per byte run */
+/* draw s at (y,x) clipped and space-padded to exactly w DISPLAY columns, using
+ * the current attributes. Width is measured with wcwidth (not strlen/bytes), so
+ * UTF-8 (em-dash, arrows, box chars, double-width glyphs) aligns to columns and
+ * the frame borders stay flush. Replaces every byte-counting mvprintw("%-*.*s").
+ */
+static void draw_field(int y, int x, int w, const char *s) {
+	move(y, x);
+	if (w <= 0)
+		return;
+	mbstate_t st;
+	memset(&st, 0, sizeof st);
+	int col = 0;
+	size_t i = 0, n = strlen(s);
+	while (i < n && col < w) {
+		int j = (int)i + 1;
+		while (j < (int)n && ((unsigned char)s[j] & 0xC0) == 0x80)
+			j++;
+		int cw = cell_width(s + i, j - (int)i, &st);
+		if (col + cw > w)
+			break; /* a wide glyph that won't fit the last cell: pad instead */
+		if (j - (int)i == 1 && s[i] == '\t')
+			addch(' '); /* a literal tab would jump to a tab stop; keep it 1 col */
+		else
+			addnstr(s + i, j - (int)i);
+		col += cw;
+		i = (size_t)j;
+	}
+	for (; col < w; col++)
+		addch(' ');
+}
+
 static void draw_wline(int y, int x, const WLine *w, int maxcols) {
 	move(y, x);
+	mbstate_t st;
+	memset(&st, 0, sizeof st);
 	int col = 0, i = 0;
 	while (i < w->len && col < maxcols) {
 		int j = i + 1;
 		while (j < w->len && ((unsigned char)w->t[j] & 0xC0) == 0x80)
 			j++;
+		int cw = cell_width(w->t + i, j - i, &st);
+		if (col + cw > maxcols)
+			break;
 		attrset(w->a[i]);
-		addnstr(w->t + i, j - i);
-		col++;
+		if (j - i == 1 && w->t[i] == '\t')
+			addch(' '); /* keep a literal tab to one column, not a tab-stop jump */
+		else
+			addnstr(w->t + i, j - i);
+		col += cw;
 		i = j;
 	}
 	attrset(A_NORMAL);
@@ -1670,7 +1735,7 @@ static void bar_at(int y, const char *text) {
 	if (w < 0)
 		w = 0;
 	attron(sty_bar);
-	mvprintw(y, 0, "%-*.*s", w, w, b);
+	draw_field(y, 0, w, b);
 	attroff(sty_bar);
 }
 
@@ -1696,7 +1761,7 @@ static void run_help(const char *title, const char *const *body, int n) {
 	mvprintw(y, x + 2, " %s ", title);
 	attroff(sty_bar);
 	for (int i = 0; i < n && i < h - 4; i++)
-		mvprintw(y + 2 + i, x + 2, "%-*.*s", w - 4, w - 4, body[i]);
+		draw_field(y + 2 + i, x + 2, w - 4, body[i]);
 	refresh();
 	getch();
 }
@@ -1730,7 +1795,7 @@ static int prompt_line(const char *label, char *out, size_t cap) {
 	curs_set(1);
 	for (;;) {
 		attron(sty_bar);
-		mvprintw(LINES - 1, 0, "%-*.*s", COLS, COLS, "");
+		draw_field(LINES - 1, 0, COLS, "");
 		mvprintw(LINES - 1, 0, " %s%s", label, out);
 		attroff(sty_bar);
 		int cx = 1 + (int)strlen(label) + u8len_n(out, (int)len);
@@ -1775,7 +1840,7 @@ static int prompt_line(const char *label, char *out, size_t cap) {
 /* one-keypress confirm shown on the bottom bar; true on y/Y */
 static int confirm(const char *label) {
 	attron(sty_bar);
-	mvprintw(LINES - 1, 0, "%-*.*s", COLS, COLS, "");
+	draw_field(LINES - 1, 0, COLS, "");
 	mvprintw(LINES - 1, 0, " %s", label);
 	attroff(sty_bar);
 	int c = getch();
@@ -1989,7 +2054,7 @@ static int run_editor(const char *path) {
 		bar_at(0, hd);
 		for (int i = 0; i < vh && top + i < nL; i++)
 			mvaddnstr(1 + i, 0, L[top + i].s,
-			          L[top + i].len > cols ? cols : L[top + i].len);
+			          u8_advance(L[top + i].s, cols)); /* clip by columns, not bytes */
 		char ft[256];
 		if (errmsg)
 			snprintf(ft, sizeof ft, "%s — buffer kept; retry ^O or ^X to abandon",
@@ -2216,7 +2281,7 @@ static void run_settings(void) {
 					         color_role_name[r]);
 			}
 			attrset(it == sel ? A_REVERSE : A_NORMAL);
-			mvprintw(y + it, 2, "%-*.*s", COLS - 4, COLS - 4, line);
+			draw_field(y + it, 2, COLS - 4, line);
 			attrset(A_NORMAL);
 		}
 		bar_at(LINES - 1, "config: written to your XDG config dir on every change");
@@ -2422,7 +2487,7 @@ static void menu_bar(int ctx, int active, const char *right) {
 	menus_for(ctx, &m, &n);
 	menu_layout(ctx, xs);
 	attron(sty_bar);
-	mvprintw(0, 0, "%-*.*s", COLS, COLS, "");
+	draw_field(0, 0, COLS, "");
 	mvprintw(0, 1, "OKFI");
 	attroff(sty_bar);
 	for (int i = 0; i < n; i++) {
@@ -2431,7 +2496,7 @@ static void menu_bar(int ctx, int active, const char *right) {
 		attroff(i == active ? (sty_bar | A_REVERSE) : sty_bar);
 	}
 	if (right) {
-		int rx = COLS - 2 - (int)strlen(right);
+		int rx = COLS - 2 - u8len_n(right, (int)strlen(right));
 		if (rx > xs[n - 1] + 8) {
 			attron(sty_bar);
 			mvprintw(0, rx, "%s", right);
@@ -2479,7 +2544,9 @@ static int menu_run(int ctx) {
 				continue;
 			}
 			attrset(k == ii ? A_REVERSE : A_NORMAL);
-			mvprintw(yy, dx + 1, " %-*.*s", w - 3, w - 3, m[mi].items[k].label);
+			char it[256];
+			snprintf(it, sizeof it, " %s", m[mi].items[k].label);
+			draw_field(yy, dx + 1, w - 2, it);
 			attrset(A_NORMAL);
 		}
 		refresh();
@@ -2574,7 +2641,7 @@ static int run_browser(int picker_active) {
 			else
 				snprintf(line, sizeof line, "  %s", v->label);
 			attrset(on ? A_REVERSE : (v->header ? sty_head : A_NORMAL));
-			mvprintw(yy, listx, "%-*.*s", listw, listw, line);
+			draw_field(yy, listx, listw, line);
 			attrset(A_NORMAL);
 		}
 
@@ -2595,14 +2662,14 @@ static int run_browser(int picker_active) {
 			snprintf(s, sizeof s, "%s  (%d concept%s)", vrows[sel].label,
 			         vrows[sel].count, vrows[sel].count == 1 ? "" : "s");
 			attrset(sty_head);
-			mvprintw(top, bodyx, "%-*.*s", bodyw, bodyw, s);
+			draw_field(top, bodyx, bodyw, s);
 			attrset(A_NORMAL);
 			int yy = top + 2;
 			for (int k = 0; k < nconcepts && yy < bottom; k++)
 				if (strcmp(concept_group(k), vrows[sel].label) == 0) {
 					char ln[256];
 					snprintf(ln, sizeof ln, "  \xe2\x80\xa2 %s", concept_label(k));
-					mvprintw(yy++, bodyx, "%-*.*s", bodyw, bodyw, ln);
+					draw_field(yy++, bodyx, bodyw, ln);
 				}
 		}
 
@@ -2826,17 +2893,15 @@ static void run_picker(void) {
 			top = sel - lh + 1;
 		for (int i = 0; i < lh && top + i < nbundles; i++) {
 			Bundle *b = &bundles[top + i];
-			char line[1200];
-			snprintf(line, sizeof line, "%-22s  %s", b->name, b->path);
 			int on = (top + i == sel);
+			int namew = 22, pathx = 2 + namew + 2; /* name field, 2-col gap, then path */
 			attrset(on ? A_REVERSE : A_NORMAL);
-			mvprintw(ly + i, 2, "%-*.*s", innerw, innerw, line);
-			if (!on) { /* tint the path dim */
-				int pp = 24;
-				if (pp < innerw) {
-					attrset(sty_tag);
-					mvprintw(ly + i, 2 + pp, "%.*s", innerw - pp, line + pp);
-				}
+			draw_field(ly + i, 2, innerw, ""); /* paint the whole row background */
+			draw_field(ly + i, 2, namew < innerw ? namew : innerw, b->name);
+			if (pathx - 2 < innerw) {
+				if (!on)
+					attrset(sty_tag); /* tint the path dim */
+				draw_field(ly + i, pathx, innerw - (pathx - 2), b->path);
 			}
 			attrset(A_NORMAL);
 		}
